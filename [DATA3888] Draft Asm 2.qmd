@@ -1,0 +1,218 @@
+---
+title: "[DATA3888] Draft Asm 2"
+format: html
+editor: visual
+---
+
+# Preparation
+
+## Packages
+
+```{r loadingPackages, message = FALSE, warning = FALSE}
+library(EBImage)
+library(tidyverse)
+library(randomForest)
+library(ggplot2)
+library(OpenImageR)
+library(class)
+library(abind)
+library(e1071)
+library(keras)
+library(tensorflow)
+```
+
+## Data importing
+
+```{r dataImport, warning = FALSE, message = FALSE}
+tumour = list.files('100/CD4+_T_Cells', full.names = TRUE)
+tumour_imgs = sapply(tumour, EBImage::readImage, simplify = FALSE)
+immune = list.files('100/Invasive_Tumor', full.names = TRUE)
+immune_imgs = sapply(immune, EBImage::readImage, simplify = FALSE)
+```
+
+## Training - Test set splitting
+
+```{r dataSplit, warning = FALSE, message = FALSE}
+set.seed(3888)
+# tumour
+tumour_test_index = sample(1:length(tumour), 
+                          size = 0.2 * length(tumour),
+                          replace = FALSE)
+tumour_train = tumour_imgs[-tumour_test_index]
+tumour_test = tumour_imgs[tumour_test_index]
+
+# immune
+immune_test_index = sample(1:length(immune),
+                           size = 0.2 * length(immune),
+                           replace = FALSE)
+immune_train = immune_imgs[-immune_test_index]
+immune_test = immune_imgs[immune_test_index]
+
+# training set
+img_train = rbind(tumour_train, immune_train)
+img_train_resize = lapply(img_train, resize, w = 96, h = 96)
+X_train = img_train_resize
+y_train = c(rep('tumour', 0.8 * length(tumour)), 
+            rep('immune', 0.8 * length(immune)))
+y_train = as.factor(y_train)
+
+# test set
+img_test = rbind(tumour_test, immune_test)
+img_test_resize = lapply(img_test, resize, w = 96, h = 96)
+X_test = img_test_resize
+y_test = c(rep('tumour', 0.2 * length(tumour)),
+           rep('immune', 0.2 * length(immune)))
+y_test = as.factor(y_test)
+```
+
+# Models
+
+## Pixel level classification
+
+### Random Forest
+
+```{r}
+fit = randomForest(X_train, y_train)
+predict(fit, X_test) |> table(y_test)
+```
+
+```{r}
+display(Image(array(fit$importance, dim = c(48, 48, 3))), method = "raster", all = TRUE, nx = 3)
+```
+
+### Supported Vector Machine
+
+```{r knn_pixelLevel, message = FALSE, warning = FALSE}
+svm_pixel = svm(X_train, y_train)
+svm_pred = predict(svm_pixel, X_test)
+table(svm_pred, y_test)
+```
+
+## Classification using extracted features
+
+### Histogram of Oriented Gradients
+
+```{r hog, warning = FALSE, message = FALSE}
+Xe_train = do.call(cbind, lapply(img_train, HOG, cells = 16, orientations = 12)) |> t()
+Xe_test = do.call(cbind, lapply(img_test, HOG, cells = 16, orientations = 12)) |> t()
+```
+
+### Random Forest
+
+```{r rf_e, warning = FALSE, message = FALSE}
+rf_e = randomForest(Xe_train, y_train)
+predict(rf_e, Xe_test) |> table(y_test)
+```
+
+### Supported Vector Machine
+
+```{r svm_e, warning = FALSE, message = FALSE}
+svm_e = svm(Xe_train, y_train)
+predict(svm_e, Xe_test) |> table(y_test)
+```
+
+```{r}
+knn_e = knn(Xe_train, Xe_test, cl = y_train, k = 15)
+table(knn_e, y_test)
+```
+
+```{r cnn, warning = FALSE, message = FALSE}
+library(keras3)
+library(tensorflow)
+input_shape = c(96, 96, 3)
+# learning rate controls how much the model gets updated during each round of training
+model_function = function(learning_rate = 0.001) {
+  k_clear_session()   ## clear any previous data
+  # add layers sequentially
+  # base_model = application_mobilenet_v2(weights = "imagenet", include_top = FALSE, 
+                                        #input_shape = input_shape)
+  model = keras_model_sequential() |>    ## initialises an empty model in keras
+    # 2d convolutional layer
+    layer_conv_2d(
+      filters = 256,   ## 32 filters - each filter is a small matrix that scans the image
+                      ## each filter learns different things about the image
+      kernel_size = c(5,5),   ## 3x3 kernel size, so this matrix is 3x3 in size
+      activation = NULL,
+      input_shape = input_shape
+    # image shrinks - lose 1 row and column -> becomes 26x26
+    ) |> 
+    # max pooling layer
+    layer_max_pooling_2d(pool_size = c(2,2)) |>   ## take the max value in each 2x2 grid
+    # 2d convolutional layer 2
+    layer_conv_2d(filters = 512, kernel_size = c(5,5), activation = NULL) |> 
+    # layer_conv_2d(filters = 128, kernel_size = c(3,3), activation = NULL) |> 
+    # 2nd max pooling layer
+    layer_max_pooling_2d(pool_size = c(2,2)) |> 
+    layer_conv_2d(filters = 512, kernel_size = c(5,5), activation = NULL) |> 
+    #layer_max_pooling_2d(pool_size = c(2,2)) |> 
+    #layer_conv_2d(filters = 512, kernel_size = c(5,5), activation = NULL) |> 
+    #layer_max_pooling_2d(pool_size = c(2,2)) |> 
+    #layer_conv_2d(filters = 512, kernel_size = c(5,5), activation = NULL) |> 
+    layer_max_pooling_2d(pool_size = c(2,2)) |> 
+    # dropout layer prevents overfitting by dropping some of the neurons/nodes
+    layer_dropout(rate = .2) |>   ## drop 25% of the neurons
+    # flatten 2d image into a 1d vector
+    layer_flatten() |> 
+    # sets up a layer with 128 neurons
+    layer_dense(units = 128, use_bias = FALSE) |>    ## 801*128 parameters - there is also intercept
+    # another dropout layer where we drop 25% of the neurons
+    layer_dropout(rate = .2) |> 
+    # another dense layer with 64 neurons
+    layer_dense(units = 32, use_bias = FALSE) |> 
+    # another dropout layer with 25% neurons lost
+    layer_dropout(rate = .2) |> 
+    # output layer with 2 neurons - 1 for immune and 1 for tumour
+    layer_dense(units = 2, activation = 'softmax', use_bias = FALSE)
+  
+  # compile the model
+  model |> compile(
+    loss = 'binary_crossentropy',   ## using categorical cross entropy loss - or loss means error essentially
+    optimizer = optimizer_adam(learning_rate = learning_rate),   ## minimise the loss/error
+    metrics = 'accuracy'   ## track accuracy as the performance metric during training
+  )
+  return(model)
+}
+model = model_function()
+model
+```
+
+```{r}
+Xmat_train = abind(lapply(X_train, function(x) x@.Data), along = 0)
+yMat_train = model.matrix(~y_train-1)
+shuffle_idx = sample(1:nrow(yMat_train))
+Xmat_train = Xmat_train[shuffle_idx, , , , drop = FALSE]
+yMat_train = yMat_train[shuffle_idx, , drop = FALSE]
+```
+
+```{r}
+# early_stop = callback_early_stopping(monitor = "val_loss", patience = 5, restore_best_weights = TRUE)
+#datagen = image_data_generator(
+ # rotation_range = 20,       # Rotate images up to 20 degrees
+  #width_shift_range = 0.2,   # Shift images horizontally by 20% of width
+  #height_shift_range = 0.2,  # Shift images vertically by 20% of height
+  #horizontal_flip = TRUE     # Flip images horizontally
+#)
+# Apply augmentation to training data
+#datagen |> fit_image_data_generator(Xmat_train)
+hist = model |> fit(
+  x = Xmat_train, y = yMat_train,
+  batch_size = 12,
+  steps_per_epoch = ceiling(nrow(Xmat_train)/12),
+  validation_split = 0.1, 
+  epochs = 20,
+  verbose = 2
+#  callbacks = list(early_stop)
+)
+plot(hist) + theme_classic()
+```
+
+```{r}
+Xmat_test = abind(lapply(X_test, function(x) x@.Data), along = 0)
+```
+
+```{r}
+pred_cnn = model |> predict(Xmat_test)
+pred_cnn = c('tumour', 'immune')[apply(pred_cnn, 1, which.max)]
+tab = table(y_test, pred_cnn)
+tab
+```
